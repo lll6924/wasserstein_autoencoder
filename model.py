@@ -36,7 +36,6 @@ train_config=config()
 @spt.global_reuse
 @add_arg_scope
 def q_net(x, is_initializing=False):
-    #net = spt.BayesianNet(observed=observed)
     with arg_scope([spt.layers.conv2d],
                    padding='same',
                    strides=(2, 2),
@@ -54,10 +53,7 @@ def q_net(x, is_initializing=False):
         q_z = spt.layers.conv2d(input=q_z, out_channels=train_config.conv_filters*4, kernel_size=4, name="q_net_3")
         q_z = spt.layers.conv2d(input=q_z, out_channels=train_config.conv_filters*8, kernel_size=4, name="q_net_4")
         q_z = spt.ops.reshape_tail(q_z,3,[-1], name="q_net_reshape")
-    #z_mean = spt.layers.dense(input=q_z, units=train_config.d_z, name="q_net_z_mean")
-    #z_logstd = spt.layers.dense(input=q_z, units=train_config.d_z, name="q_net_z_logstd")
     z = spt.layers.dense(input=q_z, units=train_config.d_z, name="q_net_z")
-    #net.add("q_net_z", spt.Normal(mean=z_mean,logstd=z_logstd),n_samples=n_z,group_ndims=1)
     return z
 
 @spt.global_reuse
@@ -98,7 +94,7 @@ def d_net(z,is_initializing=False):
         d = spt.layers.dense(input=d, units=512, name="d_net_2")
         d = spt.layers.dense(input=d, units=512, name="d_net_3")
         d = spt.layers.dense(input=d, units=512, name="d_net_4")
-    d = spt.layers.dense(input=d, units=1, name="d_net_output", activation_fn=tf.nn.sigmoid)
+    d = spt.layers.dense(input=d, units=1, name="d_net_output")
     return d
 
 def rand_z(size):
@@ -117,12 +113,13 @@ def main():
     random_z = tf.placeholder(tf.float32,shape=(None,)+(train_config.d_z,), name='random_z')
 
     def _gan_loss(dqz, dpz):
-        ans = tf.log(dpz*(1. - dqz))
-        return tf.reduce_mean(train_config.reg_lambda * ans)
+        loss = -tf.nn.softplus(-dpz)-dqz-tf.nn.softplus(-dqz)
+        return tf.reduce_mean(train_config.reg_lambda * loss)
 
     def _reconstruction_loss(x, recons, dqz):
         distance = tf.reduce_sum(tf.square(x - recons), axis=[1,2])
-        return tf.reduce_mean(distance + train_config.reg_lambda * tf.log(1.- dqz))
+        loss = -dqz-tf.nn.softplus(-dqz)
+        return tf.reduce_mean(distance + train_config.reg_lambda * loss)
 
     with tf.name_scope('initializing'), \
             arg_scope([p_net, q_net, d_net], is_initializing=True):
@@ -225,14 +222,14 @@ def main():
             break
 
         #pretrain
-        # cnt=0
-        # for [train_x] in train_flow:
-        #     r_z = rand_z(train_config.batch_size)
-        #     _ = session.run([pretrain_op], feed_dict={x: train_x, random_z: r_z,
-        #                                               reconstruction_learning_rate: train_config.reconstruction_learning_rate})
-        #     cnt+=1
-        #     if(cnt==10):
-        #         break
+        cnt=0
+        for [train_x] in train_flow:
+            r_z = rand_z(train_config.batch_size)
+            _ = session.run([pretrain_op], feed_dict={x: train_x, random_z: r_z,
+                                                      reconstruction_learning_rate: train_config.reconstruction_learning_rate})
+            cnt+=1
+            if(cnt==10):
+                break
 
         for epoch in range(1,train_config.max_epoch+1):
             gan_loss = []

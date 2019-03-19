@@ -1,10 +1,6 @@
 # Wasserstein Autoencoder
 Tensorflow implementation of deterministic Wasserstein Autoencoder[1] with MNIST[2]
 
-## Warning
-
-There is a bug that some experiments may run into NAN. This becomes worse if we use pretrain described in the original paper. So this code deleted the pretrain.
-
 ## Prerequisites
 
 ```
