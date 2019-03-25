@@ -27,7 +27,7 @@ class config(spt.Config):
     plotting_shape = (10,10)
     plotting_number = 100
     max_epoch = 100
-    conv_filters = 128
+    conv_filters = 4#128
     grad_clip_norm=None
 
 train_config=config()
@@ -35,7 +35,8 @@ train_config=config()
 
 @spt.global_reuse
 @add_arg_scope
-def q_net(x, is_initializing=False):
+def q_net(x, observed=None, is_initializing=False):
+    net = spt.BayesianNet(observed=observed)
     with arg_scope([spt.layers.conv2d],
                    padding='same',
                    strides=(2, 2),
@@ -53,12 +54,15 @@ def q_net(x, is_initializing=False):
         q_z = spt.layers.conv2d(input=q_z, out_channels=train_config.conv_filters*4, kernel_size=4, name="q_net_3")
         q_z = spt.layers.conv2d(input=q_z, out_channels=train_config.conv_filters*8, kernel_size=4, name="q_net_4")
         q_z = spt.ops.reshape_tail(q_z,3,[-1], name="q_net_reshape")
-    z = spt.layers.dense(input=q_z, units=train_config.d_z, name="q_net_z")
-    return z
+    z_mean = spt.layers.dense(input=q_z, units=train_config.d_z, name="q_net_z_mean", kernel_initializer=tf.zeros_initializer)
+    z_logstd = spt.layers.dense(input=q_z, units=train_config.d_z, name="q_net_z_logstd", kernel_initializer=tf.zeros_initializer)
+    z = net.add("q_net_z",spt.Normal(mean=z_mean, logstd=z_logstd),group_ndims=1)
+    return net
 
 @spt.global_reuse
 @add_arg_scope
-def p_net(z,is_initializing=False):
+def p_net(z,observed=None, is_initializing=False):
+    net = spt.BayesianNet(observed=observed)
     with arg_scope([spt.layers.conv2d, spt.layers.deconv2d],
                    strides=(2,2),
                    padding='same',
@@ -74,9 +78,10 @@ def p_net(z,is_initializing=False):
         p_x = spt.ops.reshape_tail(input=p_x, ndims=1, shape=(7,7,train_config.conv_filters*8), name="p_net_2")
         p_x = spt.layers.deconv2d(input=p_x, out_channels=train_config.conv_filters*4, kernel_size=4, name="p_net_3")
         p_x = spt.layers.deconv2d(input=p_x, out_channels=train_config.conv_filters*2, kernel_size=4, name="p_net_4")
-    p_x = spt.layers.conv2d(input=p_x, out_channels=1, kernel_size=4, strides=(1,1),
-                            padding='same', activation_fn=tf.nn.sigmoid, name="p_net_x")
-    return p_x
+    x_logits = spt.layers.conv2d(input=p_x, out_channels=1, kernel_size=4, strides=(1,1),
+                            padding='same', name="p_net_x_logits", kernel_initializer=tf.zeros_initializer)
+    p_x = net.add("p_net_x",spt.Bernoulli(logits=x_logits, dtype=tf.float32),group_ndims=3)
+    return net
 
 @spt.global_reuse
 @add_arg_scope
@@ -101,7 +106,10 @@ def rand_z(size):
     return np.random.normal(loc=np.zeros(train_config.d_z), scale=np.ones(train_config.d_z),size=(size,) + (train_config.d_z,))
 
 def main():
-    res_dir='results/wae_mnist'
+    res_dir='results/aae_mnist'
+    plotting_dir = os.path.join(res_dir, 'plotting')
+    if not os.path.isdir(plotting_dir):
+        os.makedirs(plotting_dir)
     sys.stdout = Logger(os.path.join(res_dir,'console.log'), sys.stdout)
     sys.stderr = Logger(os.path.join(res_dir,'error.log'), sys.stderr)
     arg_parser = ArgumentParser()
@@ -116,38 +124,39 @@ def main():
         loss = -tf.nn.softplus(-dpz)-dqz-tf.nn.softplus(-dqz)
         return tf.reduce_mean(train_config.reg_lambda * loss)
 
-    def _reconstruction_loss(x, recons, dqz):
-        distance = tf.reduce_sum(tf.square(x - recons), axis=[1,2])
-        loss = -dqz-tf.nn.softplus(-dqz)
-        return tf.reduce_mean(distance + train_config.reg_lambda * loss)
+    def _reconstruction_loss(x, log_x_z, dqz):
+        #recons = tf.nn.sigmoid(logits)
+        #multiprob = tf.reduce_sum(tf.log(1.-tf.abs(recons-x)), axis=[1,2])
+        multiprob = tf.reduce_sum(log_x_z,axis=[1,2])
+        loss = -tf.nn.softplus(-dqz)
+        return tf.reduce_mean(-multiprob - train_config.reg_lambda * loss)
 
     with tf.name_scope('initializing'), \
             arg_scope([p_net, q_net, d_net], is_initializing=True):
-        init_qz = q_net(x)
+        init_qz = q_net(x)["q_net_z"]
         init_dqz = d_net(init_qz)
         init_dpz = d_net(random_z)
-        init_recons = p_net(init_qz)
+        init_log_x_z = p_net(init_qz)["p_net_x"].distribution.log_prob(x)
         init_gan_loss = _gan_loss(init_dqz, init_dpz)
-        init_reconstruction_loss = _reconstruction_loss(x, init_recons, init_dqz)
+        init_reconstruction_loss = _reconstruction_loss(x, init_log_x_z, init_dqz)
 
     with tf.name_scope('training'), \
             arg_scope([p_net, q_net, d_net], is_initializing=False):
-        train_qz = q_net(x)
+        train_qz = q_net(x)["q_net_z"]
         train_dqz = d_net(train_qz)
         train_dpz = d_net(random_z)
-        train_recons = p_net(train_qz)
+        train_log_x_z = p_net(train_qz)["p_net_x"].distribution.log_prob(x)
         train_gan_loss = _gan_loss(train_dqz, train_dpz)
-        train_reconstruction_loss = _reconstruction_loss(x, train_recons, train_dqz)
-
+        train_reconstruction_loss = _reconstruction_loss(x, train_log_x_z, train_dqz)
 
     with tf.name_scope('testing'), \
             arg_scope([p_net, q_net, d_net], is_initializing=False):
-        test_qz = q_net(x)
+        test_qz = q_net(x)["q_net_z"]
         test_dqz = d_net(test_qz)
         test_dpz = d_net(random_z)
-        test_recons = p_net(test_qz)
+        test_log_x_z = p_net(test_qz)["p_net_x"].distribution.log_prob(x)
         test_gan_loss = _gan_loss(test_dqz, test_dpz)
-        test_reconstruction_loss = _reconstruction_loss(x, test_recons, test_dqz)
+        test_reconstruction_loss = _reconstruction_loss(x, test_log_x_z, test_dqz)
 
     with tf.name_scope('optimizing'):
         gan_optimizer = tf.train.AdamOptimizer(learning_rate=gan_learning_rate,
@@ -182,8 +191,8 @@ def main():
 
     with tf.name_scope('plotting'), \
             arg_scope([p_net], is_initializing=False):
-        plot_gens = p_net(random_z)
-        plot_recons = p_net(z=q_net(x))
+        plot_gens = tf.sigmoid(p_net(random_z)["p_net_x"].distribution.logits)
+        plot_recons = tf.sigmoid(p_net(z=q_net(x)["q_net_z"])["p_net_x"].distribution.logits)
 
     (x_train, y_train), (x_test, y_test) = \
         spt.datasets.load_mnist(x_shape=train_config.shape)
@@ -196,9 +205,6 @@ def main():
     first_images = test_flow.get_arrays()[0]
     first_images = first_images[:train_config.plotting_number]
 
-    plotting_dir = os.path.join(res_dir, 'plotting')
-    if not os.path.isdir(plotting_dir):
-        os.makedirs(plotting_dir)
     save_images_collection(first_images*255., os.path.join(plotting_dir, 'origin.png'), grid_size=train_config.plotting_shape)
 
     def plotting(epoch):
@@ -237,16 +243,18 @@ def main():
             start_time = time.time()
             for [train_x] in train_flow:
                 r_z = rand_z(train_config.batch_size)
-                train_g_l, _ = session.run([train_gan_loss, train_op_1],
+                train_g_l, _, dpz, dqz = session.run([train_gan_loss, train_op_1, train_dpz, train_qz],
                                            feed_dict={x:train_x, random_z:r_z, gan_learning_rate: train_config.gan_learning_rate})
                 train_r_l, _ = session.run([train_reconstruction_loss, train_op_2],
                                            feed_dict={x:train_x, random_z:r_z, reconstruction_learning_rate:train_config.reconstruction_learning_rate})
+                #print(r_z)
+                #print(dqz)
                 gan_loss.append(train_g_l)
                 reconstruction_loss.append(train_r_l)
             print("epoch ", epoch, ", (time: ", time.time() - start_time, ")")
             print("train_gan_loss:", np.mean(gan_loss), " train_reconstruction_loss:",
                   np.mean(reconstruction_loss))
-            if epoch % 10 ==0:
+            if epoch % 1 ==0:
                 gan_loss = []
                 reconstruction_loss = []
                 start_time = time.time()
